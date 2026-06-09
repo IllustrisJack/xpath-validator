@@ -14,8 +14,11 @@ use clap::Parser;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::Serialize;
-use sxd_document::parser as sxd_parser;
 use sxd_document::Package;
+use sxd_document::dom::{ChildOfElement, Document, Element};
+use sxd_document::parser as sxd_parser;
+use sxd_document::QName;
+use sxd_xpath::nodeset::Node;
 use sxd_xpath::{Factory, Value};
 use walkdir::WalkDir;
 
@@ -47,7 +50,6 @@ fn strict_parse_check(source: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// CLI args.
 #[derive(Parser, Debug)]
 #[command(
     name = "x4-xpath-validator",
@@ -55,7 +57,7 @@ fn strict_parse_check(source: &str) -> std::result::Result<(), String> {
     long_about = None,
 )]
 struct Args {
-    /// Path to mod root (e.g. I:\Software\deadair_scripts)
+    /// Path to mod root (e.g. I:\Software\dynamic_universe)
     #[arg(long)]
     mod_root: PathBuf,
 
@@ -72,7 +74,6 @@ struct Args {
     quiet: bool,
 }
 
-/// Operation in a `<diff>`.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 enum Op {
     Add,
@@ -105,7 +106,6 @@ enum Status {
     BrokenXpath,
     MissingVanilla,
     ParseError,
-    DlcUnverified,
 }
 
 impl Status {
@@ -115,7 +115,6 @@ impl Status {
             Status::BrokenXpath => "BROKEN",
             Status::MissingVanilla => "NO VANILLA",
             Status::ParseError => "PARSE",
-            Status::DlcUnverified => "DLC SKIP",
         }
     }
 }
@@ -139,44 +138,372 @@ fn is_non_diff(rel: &Path) -> bool {
         || s.starts_with("t/0001.xml")
 }
 
-/// Mod file -> vanilla file by identical relative path.
+/// Resolve a mod-relative path against the vanilla snapshot root. For mod files
+/// living under `extensions/ego_dlc_X/...`, the vanilla side keeps the same path;
+/// for base files under `libraries/...` etc, it's a direct join.
 fn resolve_vanilla_path(vanilla_root: &Path, mod_rel: &Path) -> Option<PathBuf> {
     let candidate = vanilla_root.join(mod_rel);
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
+    if candidate.exists() { Some(candidate) } else { None }
+}
+
+// ---------- deep clone across packages ----------
+
+fn deep_clone_child<'dst>(
+    src: ChildOfElement<'_>,
+    dst_doc: Document<'dst>,
+) -> Option<ChildOfElement<'dst>> {
+    match src {
+        ChildOfElement::Element(src_el) => {
+            let sname = src_el.name();
+            let qn = QName::with_namespace_uri(sname.namespace_uri(), sname.local_part());
+            let new_el = dst_doc.create_element(qn);
+            for attr in src_el.attributes() {
+                let an = attr.name();
+                let aqn = QName::with_namespace_uri(an.namespace_uri(), an.local_part());
+                new_el.set_attribute_value(aqn, attr.value());
+            }
+            for c in src_el.children() {
+                if let Some(cloned) = deep_clone_child(c, dst_doc) {
+                    new_el.append_child(cloned);
+                }
+            }
+            Some(ChildOfElement::Element(new_el))
+        }
+        ChildOfElement::Text(t) => Some(ChildOfElement::Text(dst_doc.create_text(t.text()))),
+        ChildOfElement::Comment(c) => {
+            Some(ChildOfElement::Comment(dst_doc.create_comment(c.text())))
+        }
+        _ => None,
     }
 }
 
-/// Crude line counter — sxd-document doesn't preserve source lines, so we scan the
-/// raw text and count newlines up to the byte offset of the first occurrence of
-/// the sel attribute literal. Good enough to point a human at the file region.
-fn locate_sel_line(source: &str, sel_value: &str) -> usize {
-    let needle = format!("sel=\"{}\"", sel_value);
-    if let Some(idx) = source.find(&needle) {
-        source[..idx].bytes().filter(|&b| b == b'\n').count() + 1
-    } else {
-        0
+// ---------- diff application ----------
+
+/// Collect direct text-node children of a diff op (the body for attribute-set ops).
+fn collect_text(el: Element<'_>) -> String {
+    let mut s = String::new();
+    for c in el.children() {
+        if let ChildOfElement::Text(t) = c {
+            s.push_str(t.text());
+        }
+    }
+    s
+}
+
+/// True if this diff element's body contains any element children (vs text-only).
+fn has_element_children(el: Element<'_>) -> bool {
+    el.children()
+        .into_iter()
+        .any(|c| matches!(c, ChildOfElement::Element(_)))
+}
+
+/// Replace `target` in its parent's child list with the deep-cloned children of `diff_el`.
+fn replace_element_with_diff_content<'van>(
+    target: Element<'van>,
+    diff_el: Element<'_>,
+    van_doc: Document<'van>,
+) {
+    let parent_el = match target.parent() {
+        Some(sxd_document::dom::ParentOfChild::Element(p)) => p,
+        _ => return,
+    };
+    let current = parent_el.children();
+    let mut new_children: Vec<ChildOfElement<'van>> = Vec::with_capacity(current.len());
+    for c in current {
+        if matches!(c, ChildOfElement::Element(e) if e == target) {
+            for diff_child in diff_el.children() {
+                if let Some(cloned) = deep_clone_child(diff_child, van_doc) {
+                    new_children.push(cloned);
+                }
+            }
+        } else {
+            new_children.push(c);
+        }
+    }
+    parent_el.replace_children(new_children);
+}
+
+/// Insert deep-cloned children of `diff_el` as siblings of `target`, before or after.
+fn insert_sibling_with_diff_content<'van>(
+    target: Element<'van>,
+    diff_el: Element<'_>,
+    van_doc: Document<'van>,
+    after: bool,
+) {
+    let parent_el = match target.parent() {
+        Some(sxd_document::dom::ParentOfChild::Element(p)) => p,
+        _ => return,
+    };
+    let current = parent_el.children();
+    let mut new_children: Vec<ChildOfElement<'van>> = Vec::with_capacity(current.len() + 4);
+    for c in current {
+        let is_target = matches!(c, ChildOfElement::Element(e) if e == target);
+        if is_target && !after {
+            for diff_child in diff_el.children() {
+                if let Some(cloned) = deep_clone_child(diff_child, van_doc) {
+                    new_children.push(cloned);
+                }
+            }
+        }
+        new_children.push(c);
+        if is_target && after {
+            for diff_child in diff_el.children() {
+                if let Some(cloned) = deep_clone_child(diff_child, van_doc) {
+                    new_children.push(cloned);
+                }
+            }
+        }
+    }
+    parent_el.replace_children(new_children);
+}
+
+/// Apply one diff op to a vanilla document. Best-effort: silent no-op if the sel
+/// doesn't match anything (the caller already reported the broken/no-match state).
+fn apply_diff_op<'van>(
+    factory: &Factory,
+    op: Op,
+    diff_el: Element<'_>,
+    sel: &str,
+    van_doc: Document<'van>,
+) {
+    let xpath = match factory.build(sel) {
+        Ok(Some(x)) => x,
+        _ => return,
+    };
+    let ctx = sxd_xpath::Context::new();
+    let val = match xpath.evaluate(&ctx, van_doc.root()) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let nodes: Vec<Node<'van>> = match val {
+        Value::Nodeset(ns) => ns.iter().collect(),
+        _ => return,
+    };
+
+    let type_attr = diff_el.attribute_value("type").map(|s| s.to_string());
+    let pos_attr = diff_el.attribute_value("pos").map(|s| s.to_string());
+
+    match op {
+        Op::Remove => {
+            for n in nodes {
+                match n {
+                    Node::Element(e) => e.remove_from_parent(),
+                    Node::Attribute(a) => a.remove_from_parent(),
+                    Node::Text(t) => t.remove_from_parent(),
+                    _ => {}
+                }
+            }
+        }
+        Op::Replace => {
+            let text_value = collect_text(diff_el);
+            for n in nodes {
+                match n {
+                    Node::Attribute(a) => {
+                        if let Some(parent) = a.parent() {
+                            let an = a.name();
+                            let aqn = QName::with_namespace_uri(an.namespace_uri(), an.local_part());
+                            parent.set_attribute_value(aqn, &text_value);
+                        }
+                    }
+                    Node::Element(target) => {
+                        if has_element_children(diff_el) {
+                            replace_element_with_diff_content(target, diff_el, van_doc);
+                        } else {
+                            // Replace element with the diff body as plain text (rare).
+                            if let Some(sxd_document::dom::ParentOfChild::Element(parent)) =
+                                target.parent()
+                            {
+                                let current = parent.children();
+                                let mut new_children: Vec<ChildOfElement<'van>> =
+                                    Vec::with_capacity(current.len());
+                                for c in current {
+                                    if matches!(c, ChildOfElement::Element(e) if e == target) {
+                                        new_children.push(ChildOfElement::Text(
+                                            van_doc.create_text(&text_value),
+                                        ));
+                                    } else {
+                                        new_children.push(c);
+                                    }
+                                }
+                                parent.replace_children(new_children);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Op::Add => {
+            if let Some(type_str) = type_attr.as_deref() {
+                if let Some(attr_name) = type_str.strip_prefix('@') {
+                    let val = collect_text(diff_el);
+                    for n in nodes {
+                        if let Node::Element(target) = n {
+                            target.set_attribute_value(attr_name, &val);
+                        }
+                    }
+                    return;
+                }
+            }
+            match pos_attr.as_deref() {
+                Some("before") => {
+                    for n in nodes {
+                        if let Node::Element(target) = n {
+                            insert_sibling_with_diff_content(target, diff_el, van_doc, false);
+                        }
+                    }
+                }
+                Some("after") => {
+                    for n in nodes {
+                        if let Node::Element(target) = n {
+                            insert_sibling_with_diff_content(target, diff_el, van_doc, true);
+                        }
+                    }
+                }
+                _ => {
+                    // Default: append diff children as children of matched element.
+                    for n in nodes {
+                        if let Node::Element(target) = n {
+                            for diff_child in diff_el.children() {
+                                if let Some(cloned) = deep_clone_child(diff_child, van_doc) {
+                                    target.append_child(cloned);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-/// Parse mod file, find its `<diff>` root and all add/replace/remove ops, then
-/// resolve each sel xpath against the vanilla file.
+/// Iterate the `<add>`, `<replace>`, `<remove>` children of a diff root and apply each to van_doc.
+fn apply_diff_doc<'van>(
+    factory: &Factory,
+    diff_root: Element<'_>,
+    van_doc: Document<'van>,
+) {
+    for child in diff_root.children() {
+        if let ChildOfElement::Element(diff_el) = child {
+            if let Some(op) = Op::from_tag(diff_el.name().local_part())
+                && let Some(sel) = diff_el.attribute_value("sel")
+            {
+                apply_diff_op(factory, op, diff_el, sel, van_doc);
+            }
+        }
+    }
+}
+
+/// Locate all DLC overlay files in the vanilla snapshot whose path is
+/// `extensions/ego_dlc_*/<rel>`. Returns the resolved absolute paths.
+fn find_dlc_overlays(vanilla_root: &Path, base_rel: &Path) -> Vec<PathBuf> {
+    let ext_root = vanilla_root.join("extensions");
+    if !ext_root.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(&ext_root) {
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let n = name.to_string_lossy();
+            if n.starts_with("ego_dlc_") {
+                let candidate = ent.path().join(base_rel);
+                if candidate.exists() {
+                    out.push(candidate);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cheap textual peek to decide whether the root element of an XML file is `<diff>`.
+/// Avoids a full parse just for the routing decision.
+fn peek_root_is_diff(path: &Path) -> Option<bool> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("<?") || t.starts_with("<!--") {
+            continue;
+        }
+        if !t.starts_with('<') {
+            continue;
+        }
+        // skip multi-line comments naively
+        if t.starts_with("<!") {
+            continue;
+        }
+        let after = &t[1..];
+        let end = after.find(|c: char| c.is_whitespace() || c == '>' || c == '/');
+        let name = match end {
+            Some(i) => &after[..i],
+            None => after,
+        };
+        return Some(name == "diff");
+    }
+    None
+}
+
+/// For a mod file under `extensions/ego_dlc_X/...`, return its base-file
+/// counterpart (`<rel without extensions/ego_dlc_X/ prefix>`).
+fn dlc_base_rel(rel: &Path) -> Option<PathBuf> {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    let after_ext = s.strip_prefix("extensions/")?;
+    let slash = after_ext.find('/')?;
+    let dlc_id = &after_ext[..slash];
+    if !dlc_id.starts_with("ego_dlc_") {
+        return None;
+    }
+    Some(PathBuf::from(&after_ext[slash + 1..]))
+}
+
+// ---------- top-level check ----------
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_op_against<'van>(
+    factory: &Factory,
+    op: Op,
+    sel: &str,
+    van_doc: Document<'van>,
+) -> (Status, String) {
+    let xpath = match factory.build(sel) {
+        Err(e) => return (Status::BrokenXpath, format!("xpath compile error: {e}")),
+        Ok(None) => return (Status::BrokenXpath, "empty xpath".to_string()),
+        Ok(Some(x)) => x,
+    };
+    let ctx = sxd_xpath::Context::new();
+    match xpath.evaluate(&ctx, van_doc.root()) {
+        Err(e) => (Status::BrokenXpath, format!("xpath eval error: {e}")),
+        Ok(Value::Nodeset(ns)) => {
+            if ns.size() == 0 {
+                (Status::BrokenXpath, "matched 0 nodes".to_string())
+            } else {
+                (Status::Ok, format!("{} matched {} node(s)", op.as_str(), ns.size()))
+            }
+        }
+        Ok(Value::Boolean(b)) => (
+            if b { Status::Ok } else { Status::BrokenXpath },
+            format!("boolean result: {b}"),
+        ),
+        Ok(Value::Number(n)) => (Status::Ok, format!("number result: {n}")),
+        Ok(Value::String(s)) => (Status::Ok, format!("string result: {s:?}")),
+    }
+}
+
 fn check_mod_file(
     mod_file: &Path,
     mod_root: &Path,
     vanilla_root: &Path,
     out: &mut Vec<Check>,
 ) -> Result<()> {
-    let rel = mod_file.strip_prefix(mod_root).unwrap_or(mod_file).to_path_buf();
+    let rel = mod_file
+        .strip_prefix(mod_root)
+        .unwrap_or(mod_file)
+        .to_path_buf();
 
     let mod_text = fs::read_to_string(mod_file)
         .with_context(|| format!("read mod file {}", mod_file.display()))?;
 
-    // Strict wellformedness check first. quick-xml with check_end_names catches
-    // close-tag name mismatches (e.g. <do_if>...</do_elseif>) that sxd-document
-    // silently accepts. X4's libxml2 enforces this at load time, so we must too.
     if let Err(e) = strict_parse_check(&mod_text) {
         out.push(Check {
             mod_file: rel.display().to_string(),
@@ -209,26 +536,26 @@ fn check_mod_file(
     };
 
     let mod_doc = mod_pkg.as_document();
-    let mod_root_el = match mod_doc.root().children().into_iter().find_map(|c| c.element()) {
+    let mod_root_el = match mod_doc
+        .root()
+        .children()
+        .into_iter()
+        .find_map(|c| c.element())
+    {
         Some(e) => e,
         None => return Ok(()),
     };
     if mod_root_el.name().local_part() != "diff" {
-        // Whole-file mod script (md / aiscript / t). Already filtered by is_non_diff
-        // for known cases — anything else we just skip silently.
         return Ok(());
     }
 
-    // Build operation list before doing any vanilla work, so we can record a single
-    // missing-vanilla row per op.
-    let mut ops: Vec<(Op, String)> = Vec::new();
+    let mut ops: Vec<(Op, String, Element<'_>)> = Vec::new();
     for child in mod_root_el.children() {
-        if let Some(el) = child.element() {
-            if let Some(op) = Op::from_tag(el.name().local_part()) {
-                if let Some(sel) = el.attribute("sel").map(|a| a.value().to_string()) {
-                    ops.push((op, sel));
-                }
-            }
+        if let ChildOfElement::Element(el) = child
+            && let Some(op) = Op::from_tag(el.name().local_part())
+            && let Some(sel) = el.attribute_value("sel")
+        {
+            ops.push((op, sel.to_string(), el));
         }
     }
 
@@ -236,17 +563,46 @@ fn check_mod_file(
         return Ok(());
     }
 
-    let vanilla_file = match resolve_vanilla_path(vanilla_root, &rel) {
+    // Resolve the vanilla validation target. There are three cases:
+    //
+    //   1. Mod file is a base-game diff (e.g. `libraries/jobs.xml`).
+    //      Target = vanilla's `libraries/jobs.xml`. Optionally apply every DLC
+    //      overlay at the same path so the mod sees DLC-added content too.
+    //
+    //   2. Mod file is DLC-scoped and the vanilla equivalent is itself a `<diff>`
+    //      (e.g. boron/terran jobs.xml). Target = base + that DLC's diff overlay.
+    //
+    //   3. Mod file is DLC-scoped and the vanilla equivalent is a full document
+    //      (e.g. split/jobs.xml has root `<jobs>`, terran/mapdefaults.xml has
+    //      root `<defaults>`). Target = that DLC file directly, no merging.
+    let mut base_rel = rel.clone();
+    let mut dlc_overlay_chain: Vec<PathBuf> = Vec::new();
+    if let Some(br) = dlc_base_rel(&rel) {
+        let vanilla_dlc = vanilla_root.join(&rel);
+        let vanilla_base = vanilla_root.join(&br);
+        if vanilla_dlc.exists() {
+            let dlc_is_diff = peek_root_is_diff(&vanilla_dlc).unwrap_or(false);
+            if dlc_is_diff && vanilla_base.exists() {
+                base_rel = br.clone();
+                dlc_overlay_chain.push(vanilla_dlc);
+            }
+            // else: keep base_rel = rel (the DLC file is the target).
+        } else if vanilla_base.exists() {
+            base_rel = br.clone();
+        }
+    }
+
+    let vanilla_file = match resolve_vanilla_path(vanilla_root, &base_rel) {
         Some(p) => p,
         None => {
-            for (op, sel) in ops {
+            for (op, sel, _) in &ops {
                 out.push(Check {
                     mod_file: rel.display().to_string(),
                     vanilla_file: None,
                     op: Some(op.as_str()),
-                    sel: Some(sel),
+                    sel: Some(sel.clone()),
                     status: Status::MissingVanilla,
-                    detail: format!("no vanilla file at {} in snapshot", rel.display()),
+                    detail: format!("no vanilla file at {} in snapshot", base_rel.display()),
                 });
             }
             return Ok(());
@@ -277,34 +633,91 @@ fn check_mod_file(
         }
     };
     let vanilla_doc = vanilla_pkg.as_document();
-    // If the vanilla "equivalent" is itself a <diff> document (DLC layered onto base),
-    // our mod xpaths target the merged base+DLC tree at X4 runtime — but we don't yet
-    // implement diff merging here, so any xpath that depends on DLC-added content will
-    // fail with "matched 0 nodes" as a false positive. Detect that case and emit a
-    // dedicated DLC-unverified status instead of BROKEN. Future work (task #8 in mod
-    // backlog) will implement proper merge.
-    if let Some(root_el) = vanilla_doc.root().children().into_iter().find_map(|c| c.element()) {
-        if root_el.name().local_part() == "diff" {
-            let vanilla_rel_local = vanilla_file
-                .strip_prefix(vanilla_root)
-                .unwrap_or(&vanilla_file)
-                .display()
-                .to_string();
-            for (op, sel) in ops {
+
+    // If the base vanilla is itself a `<diff>` document, we can't materialize the
+    // pre-existing tree, so emit BROKEN-with-explanation rather than silently OK.
+    let vanilla_root_el = match vanilla_doc
+        .root()
+        .children()
+        .into_iter()
+        .find_map(|c| c.element())
+    {
+        Some(e) => e,
+        None => {
+            for (op, sel, _) in &ops {
                 out.push(Check {
                     mod_file: rel.display().to_string(),
-                    vanilla_file: Some(vanilla_rel_local.clone()),
+                    vanilla_file: Some(
+                        vanilla_file
+                            .strip_prefix(vanilla_root)
+                            .unwrap_or(&vanilla_file)
+                            .display()
+                            .to_string(),
+                    ),
                     op: Some(op.as_str()),
-                    sel: Some(sel),
-                    status: Status::DlcUnverified,
-                    detail: "vanilla equivalent is itself a <diff> — DLC merge not implemented, xpath assumed valid".to_string(),
+                    sel: Some(sel.clone()),
+                    status: Status::ParseError,
+                    detail: "vanilla has no root element".to_string(),
                 });
             }
             return Ok(());
         }
-    }
+    };
+
     let factory = Factory::new();
-    let context = sxd_xpath::Context::new();
+
+    // Vanilla side: if the base file is also a diff (e.g. mod targets a file that's
+    // entirely DLC-scoped on the vanilla side), bail with a clearer message.
+    if vanilla_root_el.name().local_part() == "diff" && dlc_overlay_chain.is_empty() {
+        for (op, sel, _) in &ops {
+            out.push(Check {
+                mod_file: rel.display().to_string(),
+                vanilla_file: Some(
+                    vanilla_file
+                        .strip_prefix(vanilla_root)
+                        .unwrap_or(&vanilla_file)
+                        .display()
+                        .to_string(),
+                ),
+                op: Some(op.as_str()),
+                sel: Some(sel.clone()),
+                status: Status::BrokenXpath,
+                detail: "vanilla equivalent is itself a <diff>; no base to validate against"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    // Pre-apply DLC overlays so mod xpaths see the merged base+DLC tree X4 builds at runtime.
+    // For a mod base diff (libraries/jobs.xml), apply *every* DLC's overlay at that path.
+    // For a mod DLC-scoped diff (extensions/ego_dlc_X/libraries/jobs.xml), apply only that DLC's overlay.
+    let overlay_paths: Vec<PathBuf> = if dlc_overlay_chain.is_empty() {
+        find_dlc_overlays(vanilla_root, &base_rel)
+    } else {
+        dlc_overlay_chain
+    };
+
+    for overlay_path in &overlay_paths {
+        let overlay_text = match fs::read_to_string(overlay_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let overlay_pkg = match sxd_parser::parse(&overlay_text) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let overlay_doc = overlay_pkg.as_document();
+        if let Some(root_el) = overlay_doc
+            .root()
+            .children()
+            .into_iter()
+            .find_map(|c| c.element())
+            && root_el.name().local_part() == "diff"
+        {
+            apply_diff_doc(&factory, root_el, vanilla_doc);
+        }
+    }
 
     let vanilla_rel = vanilla_file
         .strip_prefix(vanilla_root)
@@ -312,36 +725,19 @@ fn check_mod_file(
         .display()
         .to_string();
 
-    for (op, sel) in ops {
-        let _line = locate_sel_line(&mod_text, &sel); // reserved for richer reporting later
-        let (status, detail) = match factory.build(&sel) {
-            Err(e) => (Status::BrokenXpath, format!("xpath compile error: {e}")),
-            Ok(None) => (Status::BrokenXpath, "empty xpath".to_string()),
-            Ok(Some(xpath)) => match xpath.evaluate(&context, vanilla_doc.root()) {
-                Err(e) => (Status::BrokenXpath, format!("xpath eval error: {e}")),
-                Ok(Value::Nodeset(ns)) => {
-                    if ns.size() == 0 {
-                        (Status::BrokenXpath, "matched 0 nodes".to_string())
-                    } else {
-                        (Status::Ok, format!("matched {} node(s)", ns.size()))
-                    }
-                }
-                Ok(Value::Boolean(b)) => (
-                    if b { Status::Ok } else { Status::BrokenXpath },
-                    format!("boolean result: {b}"),
-                ),
-                Ok(Value::Number(n)) => (Status::Ok, format!("number result: {n}")),
-                Ok(Value::String(s)) => (Status::Ok, format!("string result: {s:?}")),
-            },
-        };
+    // Evaluate each mod op against the (mutated) vanilla, then apply it so subsequent
+    // ops see the in-file state — fixes the sequential-diff false-positive case.
+    for (op, sel, diff_el) in ops {
+        let (status, detail) = evaluate_op_against(&factory, op, &sel, vanilla_doc);
         out.push(Check {
             mod_file: rel.display().to_string(),
             vanilla_file: Some(vanilla_rel.clone()),
             op: Some(op.as_str()),
-            sel: Some(sel),
+            sel: Some(sel.clone()),
             status,
             detail,
         });
+        apply_diff_op(&factory, op, diff_el, &sel, vanilla_doc);
     }
 
     Ok(())
@@ -375,14 +771,12 @@ fn main() -> Result<()> {
     let mut broken = 0usize;
     let mut missing = 0usize;
     let mut parse_err = 0usize;
-    let mut dlc_skip = 0usize;
     for c in &checks {
         match c.status {
             Status::Ok => ok += 1,
             Status::BrokenXpath => broken += 1,
             Status::MissingVanilla => missing += 1,
             Status::ParseError => parse_err += 1,
-            Status::DlcUnverified => dlc_skip += 1,
         }
     }
 
@@ -397,7 +791,7 @@ fn main() -> Result<()> {
 
     println!();
     println!(
-        "Summary: ok={ok}  broken={broken}  missing-vanilla={missing}  parse-errors={parse_err}  dlc-skipped={dlc_skip}"
+        "Summary: ok={ok}  broken={broken}  missing-vanilla={missing}  parse-errors={parse_err}"
     );
 
     if let Some(path) = args.json_out {
