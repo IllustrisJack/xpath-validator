@@ -1,0 +1,26 @@
+[package]
+name = "x4-xpath-validator"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Validates X4 mod <diff> sel xpaths against an extracted vanilla snapshot."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IllustrisJack/xpath-validator"
+
+[[bin]]
+name = "x4-xpath-validator"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+walkdir = "2.5"
+sxd-document = "0.3"
+sxd-xpath = "0.4"
+quick-xml = "0.40"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
